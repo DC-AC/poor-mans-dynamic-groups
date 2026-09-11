@@ -5,7 +5,9 @@ a **static** security group. Azure Automation runs it on a schedule. It gives
 you dynamic-group behaviour without Entra ID P1 licensing. Dynamic membership
 rules need P1. Static group membership does not.
 
-Everything lives in [runbook.ps1](runbook.ps1).
+The sync itself lives in [runbook.ps1](runbook.ps1).
+[grant-scoped-group-admin.ps1](grant-scoped-group-admin.ps1) sets up the
+least-privilege permissions that the sync needs.
 
 ---
 
@@ -44,7 +46,24 @@ slow to install, and prone to version conflicts between submodules.
 - Import the `Az.Accounts` module. You need nothing else.
 - The PowerShell 7.x runtime is the recommended one.
 
-### Microsoft Graph application permissions
+### Permissions for the managed identity
+
+The managed identity needs two separate rights:
+
+1. **Read every user in the tenant**, to build the target set. This right is
+   `User.Read.All`. It is tenant-wide, and you cannot scope it down.
+2. **Write the membership of the target group.** Option A and option B below
+   are two ways to grant this right. Pick one.
+
+> **Do not make the managed identity only an *owner* of the group.** Group
+> ownership gives no rights to enumerate the tenant users. Owner-implied write
+> access is also inconsistent for app-only callers. Grant `User.Read.All`, plus
+> option A or option B.
+
+#### Option A: tenant-wide Graph application permissions
+
+This option is the simpler one. It also lets the managed identity rewrite the
+membership of **every** group in the tenant.
 
 Grant these two **application** (app-only) permissions to the Automation
 Account's managed identity. Grant admin consent for them.
@@ -53,11 +72,6 @@ Account's managed identity. Grant admin consent for them.
 |---|---|
 | `User.Read.All` | Enumerate the tenant users to build the target set |
 | `GroupMember.ReadWrite.All` | Add and remove group members |
-
-> **Do not make the managed identity only an *owner* of the group.** Group
-> ownership gives no rights to enumerate the tenant users. Owner-implied write
-> access is also inconsistent for app-only callers. Grant the two application
-> permissions above.
 
 Entra ID has no portal UI to grant Graph app roles to a managed identity. Run
 the block below from a machine that has `Microsoft.Graph` installed.
@@ -86,6 +100,66 @@ foreach ($role in 'User.Read.All','GroupMember.ReadWrite.All') {
         -PrincipalId $miObjectId -ResourceId $graphSp.Id -AppRoleId $appRole.Id
 }
 ```
+
+#### Option B: a directory role scoped to one administrative unit
+
+This option is the least-privilege one.
+[grant-scoped-group-admin.ps1](grant-scoped-group-admin.ps1) assigns the
+Groups Administrator role over an administrative unit that holds only the
+target group. The managed identity can then manage that one group. It is not a
+group admin anywhere else in the tenant.
+
+Entra ID cannot scope a Graph app role to a single resource. The scope has to
+come from the directory-role side instead. An administrative unit is the only
+scope boundary that group membership writes respect.
+
+**This option still needs `User.Read.All`, and the script does not grant it.**
+The runbook enumerates every non-guest user in the tenant. That read cannot be
+scoped to an administrative unit. Grant `User.Read.All` with the block from
+option A. Remove `GroupMember.ReadWrite.All` from the `foreach` list in that
+block first.
+
+```powershell
+./grant-scoped-group-admin.ps1 `
+    -GroupId    '<group-object-id>' `
+    -MiObjectId '<managed-identity-object-id>' -WhatIf
+```
+
+Drop `-WhatIf` to apply the change.
+
+| Parameter | Required | Default | Purpose |
+|---|---|---|---|
+| `-GroupId` | yes | none | The object ID of the group to manage. |
+| `-MiObjectId` | yes | none | The object ID of the managed identity. Use the service principal object ID, not the client ID or the app ID. |
+| `-AdministrativeUnitName` | no | `AU-DynamicGroupSync` | The administrative unit to create or to reuse as the scope boundary. |
+
+> **Keep the administrative unit empty except for the target group.** The
+> administrative unit is the scope boundary. The managed identity can manage
+> every group inside it. The script warns you when it finds other objects
+> there.
+
+The script needs the Global Administrator role or the Privileged Role
+Administrator role. Application Administrator is not enough, for the reason
+given under option A.
+
+Every step is idempotent, so a re-run after a partial failure is safe. The
+script stops before it creates anything if the target group has a dynamic
+membership rule. It identifies the role by the well-known template ID
+`fdd7a751-b60b-444a-984c-02652fe8fa1c`, because a display name lookup shifts
+with the directory language.
+
+The script prints the directory role assignments when it finishes. A `Scope` of
+`/` means tenant-wide. The assignment this script adds reads
+`/administrativeUnits/<administrative-unit-id>`.
+
+> **Wait a few minutes before the first runbook run.** Entra ID does not add a
+> new scoped role assignment to a token that it already issued to the managed
+> identity.
+
+[fixes.ps1](fixes.ps1) does the same work as option B and also grants
+`User.Read.All`. It has the tenant ID, the managed identity ID, and the group
+ID hardcoded at the top. Edit those three values before you run it.
+
 
 ### The target group
 
@@ -232,11 +306,13 @@ Per-item removal failures and retry notices go to `Write-Warning`.
 | Symptom | Cause |
 |---|---|
 | `Authorization_RequestDenied` on `/users` | The `User.Read.All` app role is missing, or nobody granted admin consent. Ownership of the group is not a substitute. |
-| `Authorization_RequestDenied` on the group PATCH | The `GroupMember.ReadWrite.All` app role is missing. |
+| `Authorization_RequestDenied` on the group PATCH | Under option A, the `GroupMember.ReadWrite.All` app role is missing. Under option B, the scoped role assignment is missing, or the group is not in the administrative unit. |
+| `Authorization_RequestDenied` on the group PATCH, with a scoped assignment that looks correct | Entra ID does not add a new scoped role assignment to a token it already issued. Wait a few minutes, then run again. |
+| The managed identity can write to a group you did not intend | The administrative unit holds more than the target group. Remove the other objects from the administrative unit. |
 | `Request_UnsupportedQuery`, or another advanced query error | The users request lost the `ConsistencyLevel: eventual` header or `$count=true`. The `ne` filter needs both. |
 | `One or more added object references already exist` | A user in the add chunk is already a member. The group changed between the read and the write. Re-run the script. The next diff is correct. |
 | The run aborts on `-MaxRemovalPercent` | This abort is intended. Check the reported counts against the `-ReportOnly` output before you raise the threshold. |
-| Group membership does not stick | The group has a dynamic membership rule. Convert the group to assigned membership. |
+| Group membership does not stick | The group has a dynamic membership rule. Convert the group to assigned membership. Both grant scripts also check this and stop. |
 | `Get-AzAccessToken` token issues | The script handles this. It unwraps the `SecureString` that Az.Accounts 5.x returns, and falls back to plain text on older versions. |
 
 ---
